@@ -1,0 +1,164 @@
+// GxEPD2_HelloWorld.ino by Jean-Marc Zingg
+//
+// Display Library example for SPI e-paper panels from Dalian Good Display and boards from Waveshare.
+// Requires HW SPI and Adafruit_GFX. Caution: the e-paper panels require 3.3V supply AND data lines!
+//
+// Display Library based on Demo Example from Good Display: https://www.good-display.com/companyfile/32/
+//
+// Author: Jean-Marc Zingg
+//
+// Version: see library.properties
+//
+// Library: https://github.com/ZinggJM/GxEPD2
+
+// Supporting Arduino Forum Topics (closed, read only):
+// Good Display ePaper for Arduino: https://forum.arduino.cc/t/good-display-epaper-for-arduino/419657
+// Waveshare e-paper displays with SPI: https://forum.arduino.cc/t/waveshare-e-paper-displays-with-spi/467865
+//
+// Add new topics in https://forum.arduino.cc/c/using-arduino/displays/23 for new questions and issues
+
+// see GxEPD2_wiring_examples.h for wiring suggestions and examples
+// if you use a different wiring, you need to adapt the constructor parameters!
+
+// uncomment next line to use class GFX of library GFX_Root instead of Adafruit_GFX
+// #include <GFX.h>
+
+#include <GxEPD2_BW.h>
+#include <GxEPD2_3C.h>
+#include <GxEPD2_4C.h>
+#include <GxEPD2_7C.h>
+#include <Fonts/FreeMonoBold9pt7b.h>
+
+// select the display class and display driver class in the following file (new style):
+#include "GxEPD2_display_selection_new_style.h"
+
+// or select the display constructor line in one of the following files (old style):
+// #include "GxEPD2_display_selection.h"
+// #include "GxEPD2_display_selection_added.h"
+
+// alternately you can copy the constructor from GxEPD2_display_selection.h or GxEPD2_display_selection_added.h to here
+// e.g. for Wemos D1 mini:
+// GxEPD2_BW<GxEPD2_154_D67, GxEPD2_154_D67::HEIGHT> display(GxEPD2_154_D67(/*CS=D8*/ SS, /*DC=D3*/ 0, /*RST=D4*/ 2, /*BUSY=D2*/ 4)); // GDEH0154D67
+
+// for handling alternative SPI pins (ESP32, RP2040) see example GxEPD2_Example.ino
+
+// Function prototype for our drawing function
+void drawShapes();
+
+void drawShapes()
+{
+  // Set the drawing window to the full screen
+  display.setFullWindow();
+
+  // Use the paged drawing method of GxEPD2
+  display.firstPage(); // Prepare the buffer for the first page
+  do
+  {
+    // Clear the buffer area for this page to the background color (WHITE)
+    display.fillScreen(GxEPD_WHITE);
+
+    // --- Draw various shapes using Adafruit_GFX functions ---
+    // Colors available: GxEPD_BLACK, GxEPD_WHITE
+
+    // Configure text properties
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setTextColor(GxEPD_BLACK);
+    display.setTextSize(1);
+
+    // Draw text
+    display.setCursor(5, 15); // (x, y) position for top-left of text
+    display.print("Shapes!");
+
+    // Draw Lines (x0, y0, x1, y1, color)
+    display.drawLine(0, 20, display.width() - 1, 20, GxEPD_BLACK); // Horizontal line across top
+    display.drawLine(10, 25, 10, 100, GxEPD_BLACK);                // Vertical line on left
+    display.drawLine(15, 25, 100, 100, GxEPD_BLACK);               // Diagonal line
+
+    // Draw Rectangles (x, y, width, height, color)
+    display.drawRect(15, 110, 50, 30, GxEPD_BLACK); // Outline rectangle
+
+    // Draw Filled Rectangles (x, y, width, height, color)
+    display.fillRect(75, 110, 30, 50, GxEPD_BLACK); // Filled rectangle
+
+    // Draw Rounded Rectangles (x, y, width, height, radius, color)
+    display.drawRoundRect(15, 150, 60, 30, 8, GxEPD_BLACK); // Outline rounded rectangle
+
+    // Draw Filled Rounded Rectangles (x, y, width, height, radius, color)
+    display.fillRoundRect(85, 155, 30, 40, 5, GxEPD_BLACK); // Filled rounded rectangle
+
+    // Draw Circles (x_center, y_center, radius, color)
+    display.drawCircle(30, 210, 15, GxEPD_BLACK); // Outline circle
+
+    // Draw Filled Circles (x_center, y_center, radius, color)
+    display.fillCircle(80, 210, 20, GxEPD_BLACK); // Filled circle
+
+    // Draw Triangles (x0, y0, x1, y1, x2, y2, color)
+    display.drawTriangle(display.width() / 2, 25,      // Top point
+                         display.width() / 2 - 20, 65, // Bottom left
+                         display.width() / 2 + 20, 65, // Bottom right
+                         GxEPD_BLACK);                 // Outline triangle
+
+    // Draw Filled Triangles (x0, y0, x1, y1, x2, y2, color)
+    display.fillTriangle(display.width() / 2, 70,       // Top point
+                         display.width() / 2 - 15, 100, // Bottom left
+                         display.width() / 2 + 15, 100, // Bottom right
+                         GxEPD_BLACK);                  // Filled triangle
+
+    // Draw individual pixels (x, y, color) - Example: diagonal dotted line
+    for (int i = 0; i < 20; i++)
+    {
+      display.drawPixel(display.width() - 5 - i, 5 + i, GxEPD_BLACK);
+    }
+
+    // The GxEPD2 library handles buffer paging automatically here.
+    // All drawing commands placed between firstPage() and nextPage() are rendered.
+
+  } while (display.nextPage()); // Continue drawing pages until the entire screen is updated
+}
+// ===================================================================================
+// Setup Function - Runs once on boot/reset
+// ===================================================================================
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println("Starting E-Paper Shapes Demo");
+
+  // Initialize the display library.
+  // The default init(115200) works for many boards including most LILYGO T5s.
+  display.init(115200);
+  // If the above doesn't work, try the init signature often needed for Waveshare boards:
+  // display.init(115200, true, 2, false); // More complex init: (baud, initial_reset, reset_duration, use_busy)
+
+  Serial.println("Display initialized");
+
+  // Optional: Set screen rotation
+  // 0: Portrait (122 wide, 250 high) - Default
+  // 1: Landscape (250 wide, 122 high)
+  // 2: Portrait Inverted
+  // 3: Landscape Inverted
+  display.setRotation(0); // Set to portrait
+
+  // Call the function to draw the shapes onto the display buffer and refresh
+  drawShapes();
+  Serial.println("Shapes drawn to display");
+
+  // Put the display into deep sleep mode to save power.
+  // It will retain the image without power.
+  display.hibernate();
+  Serial.println("Setup complete. Display updated and hibernating.");
+}
+
+// ===================================================================================
+// Loop Function - Runs repeatedly after setup
+// ===================================================================================
+void loop()
+{
+  // Nothing needed here for this static example.
+  // The display holds its image after hibernate.
+  // You could put the ESP32 into deep sleep here for maximum power saving.
+  delay(10000); // Prevent watchdog timeout if not using deep sleep
+}
+
+// ===================================================================================
+// Draw Shapes Function - Draws various geometric shapes
+// ===================================================================================

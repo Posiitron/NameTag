@@ -1,0 +1,344 @@
+/**
+ * @file TwoScreenBadge_DoubleClickHalt.ino
+ * @brief E-Paper badge: SINGLE click toggles Info/QR screens, DOUBLE click clears screen and halts.
+ *        Landscape, fixed QR V7/S2, stack allocation, length limit. No BLE.
+ */
+
+// Core GxEPD2 library
+#include <GxEPD2_BW.h>
+
+// Font libraries
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSans9pt7b.h>
+
+// QR Code Generation Library
+#include <qrcode.h>
+
+// Include Arduino core
+#include <Arduino.h>
+
+// === IMPORTANT: Display Configuration Header ===
+#include "GxEPD2_display_selection_new_style.h" // Ensure configured
+// === IMPORTANT ===
+
+// ===================================================================================
+// Configuration Constants
+// ===================================================================================
+const char *badgeName = "Alex Doe";
+const char *badgeTitle = "Software Engineer";
+const char *badgeContact = "alex.doe@example.com";
+const char *qrCodeDataString = "https://www.linkedin.com/in/alexdoe";
+
+const int FIXED_QR_VERSION = 7;
+const int FIXED_QR_SCALE = 2;
+const int MAX_INPUT_STRING_LENGTH = 90;
+const int QR_QUIET_ZONE_MODULES = 4;
+
+const int BUTTON_PIN = 39; // VERIFY
+
+const unsigned long DEBOUNCE_DELAY_MS = 50;
+const unsigned long DOUBLE_CLICK_WINDOW_MS = 350;
+
+enum DisplayScreen
+{
+  SCREEN_INFO,
+  SCREEN_QR
+};
+
+// ===================================================================================
+// Global Variables
+// ===================================================================================
+DisplayScreen currentScreen = SCREEN_INFO;
+bool displayNeedsUpdate = true;
+
+// Button State Variables
+int buttonReading = HIGH;
+int lastButtonReading = HIGH;
+unsigned long lastDebounceTime = 0;
+bool buttonPressedFirst = false;
+unsigned long firstClickReleaseTime = 0;
+
+// ===================================================================================
+// Function Prototypes
+// ===================================================================================
+void updateDisplay();
+void drawInfoScreen();
+void drawQrScreen();
+void drawCenteredText(const char *text, int y, const GFXfont *font, int targetW = -1, int targetX = 0);
+bool drawFixedQrCode_Stack(int x_target_area, int y_target_area, int w_target_area, int h_target_area, const char *text);
+void checkButtonWithDoubleClick();
+void clearScreenAndHalt(); // Renamed clear function
+
+// ===================================================================================
+// Setup Function
+// ===================================================================================
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial && millis() < 2000)
+    ;
+  Serial.println("\nStarting Two-Screen Badge (Double-Click HALT)");
+  Serial.printf("Button Pin: %d\n", BUTTON_PIN);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  buttonReading = digitalRead(BUTTON_PIN);
+  lastButtonReading = buttonReading;
+  Serial.printf("Initial button reading: %s\n", (buttonReading == HIGH) ? "HIGH" : "LOW");
+
+  display.init(115200);
+  Serial.println("Display initialized");
+  display.setRotation(1); // Landscape
+  Serial.printf("Display rotation: %d. Width: %d, Height: %d\n", display.getRotation(), display.width(), display.height());
+  // Initial display update happens in loop
+}
+
+// ===================================================================================
+// Loop Function - Will stop executing after double-click
+// ===================================================================================
+void loop()
+{
+  // 1. Check button
+  checkButtonWithDoubleClick(); // This might call clearScreenAndHalt(), which never returns
+
+  // 2. Update display if needed (only runs if not halted)
+  if (displayNeedsUpdate)
+  {
+    Serial.println("Display update triggered.");
+    updateDisplay();
+    displayNeedsUpdate = false;
+    Serial.println("Display update complete. Hibernating.");
+    display.hibernate();
+  }
+  delay(10);
+}
+
+// ===================================================================================
+// Update Display Function
+// ===================================================================================
+void updateDisplay()
+{ /* ... Same as before ... */
+  display.setFullWindow();
+  display.firstPage();
+  do
+  {
+    display.fillScreen(GxEPD_WHITE);
+    if (currentScreen == SCREEN_INFO)
+    {
+      drawInfoScreen();
+    }
+    else
+    {
+      drawQrScreen();
+    }
+  } while (display.nextPage());
+}
+
+// ===================================================================================
+// Clear Screen and Halt Function
+// ===================================================================================
+void clearScreenAndHalt()
+{
+  Serial.println("Clearing display and HALTING...");
+  display.setFullWindow();
+  display.firstPage();
+  do
+  {
+    display.fillScreen(GxEPD_WHITE);
+  } while (display.nextPage());
+  Serial.println("Display cleared. Entering infinite loop.");
+  display.hibernate(); // Hibernate display one last time
+
+  // --- Halt Execution ---
+  while (true)
+  {
+    delay(1000); // Keep delaying to prevent watchdog reset (maybe?)
+                 // Or potentially disable interrupts/watchdog if truly halting
+                 // ESP.deepSleep(0); // Alternative: Sleep forever (needs RST to wake)
+  }
+}
+
+// ===================================================================================
+// Draw Info Screen Function
+// ===================================================================================
+void drawInfoScreen()
+{ /* ... Same as before ... */
+  Serial.println("Drawing Info Screen (Landscape)");
+  int currentY = 30;
+  int lineSpacing = 8;
+  drawCenteredText(badgeName, currentY, &FreeSansBold12pt7b);
+  currentY += 12 + lineSpacing + 5;
+  drawCenteredText(badgeTitle, currentY, &FreeSans9pt7b);
+  currentY += 9 + lineSpacing;
+  drawCenteredText(badgeContact, currentY, &FreeSans9pt7b);
+}
+
+// ===================================================================================
+// Draw QR Screen Function
+// ===================================================================================
+void drawQrScreen()
+{ /* ... Same as before ... */
+  Serial.println("Drawing QR Screen (Landscape)");
+  int targetX = 0;
+  int targetY = 0;
+  int targetW = display.width();
+  int targetH = display.height();
+  bool qrSuccess = drawFixedQrCode_Stack(targetX, targetY, targetW, targetH, qrCodeDataString);
+  if (!qrSuccess)
+  {
+    Serial.println("QR Code drawing failed for QR screen.");
+  }
+}
+
+// ===================================================================================
+// Helper Function: Draw Centered Text
+// ===================================================================================
+void drawCenteredText(const char *text, int y, const GFXfont *font, int targetW /* = -1 */, int targetX /* = 0 */)
+{ /* ... Same as before ... */
+  if (!font || !text)
+    return;
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.setFont(font);
+  display.setTextColor(GxEPD_BLACK);
+  display.setTextSize(1);
+  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  int areaWidth = (targetW == -1) ? display.width() : targetW;
+  int areaX = (targetW == -1) ? 0 : targetX;
+  int x = areaX + ((areaWidth - w) / 2) - x1;
+  display.setCursor(x, y);
+  display.print(text);
+}
+
+// ===================================================================================
+// Draw Fixed QR Code Function - Stack Allocation Version
+// ===================================================================================
+bool drawFixedQrCode_Stack(int x_target_area, int y_target_area, int w_target_area, int h_target_area, const char *text)
+{ /* ... Same as before ... */
+  // Validation
+  if (text == NULL || text[0] == '\0')
+  {
+    drawCenteredText("No Data", display.height() / 2, &FreeSans9pt7b);
+    return false;
+  }
+  int inputLength = strlen(text);
+  if (inputLength > MAX_INPUT_STRING_LENGTH)
+  {
+    drawCenteredText("Data Too Long!", display.height() / 2, &FreeSans9pt7b);
+    return false;
+  }
+  // Buffer
+  uint32_t bufferSize = qrcode_getBufferSize(FIXED_QR_VERSION);
+  if (bufferSize == 0)
+  {
+    drawCenteredText("QR Buf Error", display.height() / 2, &FreeSans9pt7b);
+    return false;
+  }
+  uint8_t qrcodeData[bufferSize];
+  // Generation
+  QRCode qrcode;
+  esp_err_t err = qrcode_initText(&qrcode, qrcodeData, FIXED_QR_VERSION, ECC_LOW, text);
+  if (err != ESP_OK)
+  {
+    drawCenteredText("QR Gen Error", display.height() / 2, &FreeSans9pt7b);
+    return false;
+  }
+  // Scale/Size
+  int qr_modules_size = qrcode.size;
+  int scale = FIXED_QR_SCALE;
+  int module_pixel_size = scale;
+  int final_qr_pixel_size = qr_modules_size * module_pixel_size;
+  // Fit Check
+  int total_modules_needed = qr_modules_size + (2 * QR_QUIET_ZONE_MODULES);
+  int total_pixel_size_needed = total_modules_needed * module_pixel_size;
+  if (total_pixel_size_needed > w_target_area || total_pixel_size_needed > h_target_area)
+  {
+    drawCenteredText("QR Too Large!", display.height() / 2, &FreeSans9pt7b);
+    return false;
+  }
+  // Position & Draw
+  int x_offset = x_target_area + (w_target_area - final_qr_pixel_size) / 2;
+  int y_offset = y_target_area + (h_target_area - final_qr_pixel_size) / 2;
+  if (x_offset < 0)
+    x_offset = 0;
+  if (y_offset < 0)
+    y_offset = 0;
+  for (int y = 0; y < qr_modules_size; y++)
+  {
+    for (int x = 0; x < qr_modules_size; x++)
+    {
+      if (qrcode_getModule(&qrcode, x, y))
+      {
+        int moduleX = x_offset + x * module_pixel_size;
+        int moduleY = y_offset + y * module_pixel_size;
+        if (moduleX >= 0 && moduleX + module_pixel_size <= display.width() && moduleY >= 0 && moduleY + module_pixel_size <= display.height())
+        {
+          display.fillRect(moduleX, moduleY, module_pixel_size, module_pixel_size, GxEPD_BLACK);
+        }
+      }
+    }
+  }
+  return true;
+}
+
+// ===================================================================================
+// Button Check Function - With Double Click Logic (Calls Halt)
+// ===================================================================================
+void checkButtonWithDoubleClick()
+{
+  int currentReading = digitalRead(BUTTON_PIN);
+
+  // Debounce Start: Check for change
+  if (currentReading != lastButtonReading)
+  {
+    lastDebounceTime = millis();
+  }
+
+  // Debounce End: Check for stable state
+  if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY_MS)
+  {
+    // State is stable. If different from previous stable state...
+    if (currentReading != buttonReading)
+    {
+      buttonReading = currentReading; // Update stable state
+
+      // Process State Change
+      if (buttonReading == LOW)
+      { // Press Detected
+        Serial.println("Button Press Detected");
+        if (buttonPressedFirst && (millis() - firstClickReleaseTime) < DOUBLE_CLICK_WINDOW_MS)
+        {
+          // *** DOUBLE CLICK DETECTED ***
+          Serial.println(">>> DOUBLE CLICK <<<");
+          clearScreenAndHalt(); // Call the HALT function
+                                // --- EXECUTION WILL NOT RETURN FROM clearScreenAndHalt() ---
+        }
+        else
+        {
+          buttonPressedFirst = true; // Potential first click
+        }
+      }
+      else
+      { // Release Detected (currentReading == HIGH)
+        if (buttonPressedFirst)
+        {
+          Serial.println("Button Release Detected (after first press)");
+          firstClickReleaseTime = millis(); // Record release time
+        }
+      }
+    }
+  }
+
+  // Check for Single Click Timeout
+  if (buttonPressedFirst && buttonReading == HIGH && (millis() - firstClickReleaseTime) >= DOUBLE_CLICK_WINDOW_MS)
+  {
+    // *** SINGLE CLICK CONFIRMED ***
+    Serial.println(">>> SINGLE CLICK <<<");
+    currentScreen = (currentScreen == SCREEN_INFO) ? SCREEN_QR : SCREEN_INFO;
+    Serial.printf("New screen state: %s\n", (currentScreen == SCREEN_INFO) ? "INFO" : "QR");
+    displayNeedsUpdate = true;
+    buttonPressedFirst = false; // Reset tracking
+  }
+
+  // Update last reading
+  lastButtonReading = currentReading;
+}
