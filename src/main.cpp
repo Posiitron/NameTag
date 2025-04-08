@@ -1,9 +1,12 @@
 /**
- * @file BleQrBadge_SingleChar_PartialText.ino
+ * @file BleQrBadge_SingleChar_PartialText_V2.ino
  * @brief E-Paper badge: Displays QR code from BLE URL via a single characteristic.
  *        Uses partial updates for text status, full updates for QR/Clear.
  *        Command "clear" on the same characteristic clears the screen.
- *        Landscape & Centered.
+ *        Ensures full clear occurs when transitioning from full update (QR/Clear)
+ *        to partial update (Status).
+ *        Landscape & Centered. Single Service/Characteristic.
+ * @author Amir Akrami
  */
 
 // Core GxEPD2 library
@@ -19,6 +22,7 @@
 #include <Arduino.h>
 
 // === IMPORTANT: Display Configuration Header ===
+// Selected display type is in this file
 #include "GxEPD2_display_selection_new_style.h"
 // === IMPORTANT ===
 
@@ -40,24 +44,17 @@ const int MAX_INPUT_STRING_LENGTH = 90;
 const int QR_QUIET_ZONE_MODULES = 4;
 
 // --- BLE Configuration ---
-// TODO: Generate your own unique UUIDs for production!
+// TODO: Generate my own unique UUIDs for production!
 #define SERVICE_UUID             "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define DATA_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Single characteristic for URL or "clear" command
 
 const char* bleDeviceName = "EPaper QR Badge";
 
 // --- Partial Update Configuration ---
-// Define the area for status messages (centered)
-const int STATUS_AREA_WIDTH = 200; // Adjust as needed
-const int STATUS_AREA_HEIGHT = 50;  // Adjust as needed
-// Calculate top-left corner for centering the status area
-// Note: display dimensions might not be available yet, calculate in setup if needed
-// For now, assume typical landscape small display like 250x122
-// const int STATUS_AREA_X = (250 - STATUS_AREA_WIDTH) / 2; // Example, will calculate properly later
-// const int STATUS_AREA_Y = (122 - STATUS_AREA_HEIGHT) / 2; // Example, will calculate properly later
-int STATUS_AREA_X = 0; // Will be set in setup()
-int STATUS_AREA_Y = 0; // Will be set in setup()
-
+const int STATUS_AREA_WIDTH = 200;
+const int STATUS_AREA_HEIGHT = 50;
+int STATUS_AREA_X = 0;
+int STATUS_AREA_Y = 0;
 
 // ===================================================================================
 // Global Variables
@@ -66,11 +63,13 @@ int STATUS_AREA_Y = 0; // Will be set in setup()
 // 'display' object created in GxEPD2_display_selection_new_style.h
 
 // --- Data Handling ---
-String currentDataString = "";   // Store the URL or command received via BLE
-bool newQrDataReceived = false;  // Flag for new QR URL
-bool clearDisplayRequested = false; // Flag for clear command
-bool statusUpdateRequested = false; // Flag for new status message
-String statusMessageToShow = "";   // Store status message text
+String currentDataString = "";
+bool newQrDataReceived = false;
+bool clearDisplayRequested = false;
+bool statusUpdateRequested = false;
+String statusMessageToShow = "";
+// *** NEW FLAG ***: Tracks if the screen needs a full clear before the next status message
+bool needsFullClearBeforeNextStatus = true; // Start true to ensure first status message clears screen properly
 
 // --- BLE ---
 BLEServer *pServer = NULL;
@@ -81,12 +80,13 @@ bool deviceConnected = false;
 // Function Prototypes
 // ===================================================================================
 void setupBLE();
-void showStatusMessage(const char* message); // Uses partial update
-void updateQrDisplay(const char* textToEncode); // Uses full update
-void drawQrScreen(const char* textToEncode);
-void drawCenteredText(const char *text, int y, const GFXfont *font, int targetW = -1, int targetX = 0);
+void showStatusMessage(const char* message);       // Uses PARTIAL update
+void updateQrDisplay(const char* textToEncode);    // Uses FULL update
+void drawQrScreen(const char* textToEncode);       // Draws content for QR full update
+void clearDisplay();                               // Uses FULL update (blank screen)
+void performQuickFullClear();                      // Helper for full clear without hibernation
+void drawCenteredText(const char *text, int baselineY, const GFXfont *font, int targetW = -1, int targetX = 0);
 bool drawQrCode(int x_target_area, int y_target_area, int w_target_area, int h_target_area, const char *text);
-void clearDisplay(); // Uses full update
 
 // ===================================================================================
 // BLE Callback Classes
@@ -97,7 +97,6 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onConnect(BLEServer* pServer) {
         deviceConnected = true;
         Serial.println("BLE Client Connected");
-        // Set flag to show connected status in loop (using partial update)
         statusMessageToShow = "Connected.\nWaiting for data...";
         statusUpdateRequested = true;
     }
@@ -105,11 +104,9 @@ class MyServerCallbacks: public BLEServerCallbacks {
     void onDisconnect(BLEServer* pServer) {
         deviceConnected = false;
         Serial.println("BLE Client Disconnected");
-        // Set flag to show disconnected status in loop (using partial update)
         statusMessageToShow = "Disconnected.\nAdvertising...";
         statusUpdateRequested = true;
-        // Restart advertising
-        delay(500); // Short delay before restarting
+        delay(500);
         BLEDevice::startAdvertising();
         Serial.println("Advertising restarted");
     }
@@ -119,37 +116,35 @@ class MyServerCallbacks: public BLEServerCallbacks {
 class DataCharacteristicCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
         std::string value = pCharacteristic->getValue();
-        Serial.print("Received Value: ");
-        Serial.println(value.c_str());
+        String valueStr = String(value.c_str());
+        valueStr.trim();
 
-        if (value == "clear") {
-            // Received the clear command
+        Serial.print("Received Value: '");
+        Serial.print(valueStr);
+        Serial.println("'");
+
+        if (valueStr.equalsIgnoreCase("clear")) {
             Serial.println("Clear command recognized.");
-            clearDisplayRequested = true; // Set flag for main loop
-            newQrDataReceived = false; // Ensure QR flag is off
-            statusUpdateRequested = false; // Ensure status flag is off
-        } else if (value.length() > 0) {
-            // Received potential URL data
-            if (value.length() > MAX_INPUT_STRING_LENGTH) {
-                Serial.printf("Error: Received data length (%d) exceeds maximum (%d)\n", value.length(), MAX_INPUT_STRING_LENGTH);
+            clearDisplayRequested = true;
+            newQrDataReceived = false;
+            statusUpdateRequested = false;
+        }
+        else if (valueStr.length() > 0) {
+            if (valueStr.length() > MAX_INPUT_STRING_LENGTH) {
+                Serial.printf("Error: Received data length (%d) exceeds maximum (%d)\n", valueStr.length(), MAX_INPUT_STRING_LENGTH);
                 statusMessageToShow = "Error: Data Too Long";
-                statusUpdateRequested = true;
-                newQrDataReceived = false; // Ensure QR flag is off
-                clearDisplayRequested = false; // Ensure clear flag is off
+                statusUpdateRequested = true; // Trigger status update
+                newQrDataReceived = false;
+                clearDisplayRequested = false;
             } else {
-                // Valid URL length, store it and set flag
-                currentDataString = String(value.c_str());
-                newQrDataReceived = true; // Set flag for QR update
-                clearDisplayRequested = false; // Ensure clear flag is off
-                statusUpdateRequested = false; // Ensure status flag is off
-                Serial.println("New QR data flag set.");
-                // Optionally show "Processing..." status?
-                // statusMessageToShow = "Processing QR...";
-                // statusUpdateRequested = true;
+                Serial.println("New QR data received.");
+                currentDataString = valueStr;
+                newQrDataReceived = true;
+                clearDisplayRequested = false;
+                statusUpdateRequested = false;
             }
         } else {
-            Serial.println("Received empty value.");
-            // Optionally show an error or ignore
+            Serial.println("Received empty value. Ignoring.");
         }
     }
 };
@@ -160,12 +155,12 @@ class DataCharacteristicCallbacks: public BLECharacteristicCallbacks {
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 2000);
-    Serial.println("\nStarting BLE QR Badge (Single Char, Partial Text)");
+    Serial.println("\nStarting BLE QR Badge (Single Char, Partial Text V2)");
 
     // --- Initialize Display ---
     display.init(115200);
     Serial.println("Display initialized");
-    display.setRotation(1); // Landscape
+    display.setRotation(1);
     int screenW = display.width();
     int screenH = display.height();
     Serial.printf("Display rotation: %d. Width: %d, Height: %d\n", display.getRotation(), screenW, screenH);
@@ -173,9 +168,15 @@ void setup() {
     // --- Calculate Status Area Position ---
     STATUS_AREA_X = (screenW - STATUS_AREA_WIDTH) / 2;
     STATUS_AREA_Y = (screenH - STATUS_AREA_HEIGHT) / 2;
-     if (STATUS_AREA_X < 0) STATUS_AREA_X = 0; // Ensure non-negative coords
-     if (STATUS_AREA_Y < 0) STATUS_AREA_Y = 0;
-    Serial.printf("Status message area: x=%d, y=%d, w=%d, h=%d\n", STATUS_AREA_X, STATUS_AREA_Y, STATUS_AREA_WIDTH, STATUS_AREA_HEIGHT);
+    if (STATUS_AREA_X < 0) STATUS_AREA_X = 0;
+    if (STATUS_AREA_Y < 0) STATUS_AREA_Y = 0;
+    Serial.printf("Status message area (for partial update): x=%d, y=%d, w=%d, h=%d\n",
+                  STATUS_AREA_X, STATUS_AREA_Y, STATUS_AREA_WIDTH, STATUS_AREA_HEIGHT);
+
+    // --- Initial Screen Clear (Full Update) ---
+    Serial.println("Performing initial full screen clear.");
+    performQuickFullClear(); // Use helper to clear without hibernating yet
+    needsFullClearBeforeNextStatus = false; // Screen is now clean, reset flag
 
     // --- Show Initial Message (using partial update) ---
     statusMessageToShow = "Initializing BLE...";
@@ -184,7 +185,7 @@ void setup() {
     // --- Initialize BLE ---
     setupBLE();
 
-    // --- Update Waiting Message (after BLE setup) ---
+    // --- Update Waiting Message ---
     statusMessageToShow = "Waiting for Connection...";
     statusUpdateRequested = true; // Trigger update in loop
 
@@ -195,34 +196,43 @@ void setup() {
 // Loop Function
 // ===================================================================================
 void loop() {
-    // Prioritize actions: Clear > QR Update > Status Update
+    // --- Handle Display Actions based on Flags (Priority: Clear > QR > Status) ---
+
     if (clearDisplayRequested) {
-        clearDisplayRequested = false; // Reset flag
-        clearDisplay();                // FULL update
+        clearDisplayRequested = false; // Reset flag *before* action
+        Serial.println("Processing 'clear' command...");
+        clearDisplay();                // FULL update to blank screen
         Serial.println("Display cleared via BLE command.");
-        // Show confirmation status message (PARTIAL update)
-        statusMessageToShow = "Display Cleared";
-        statusUpdateRequested = true;
-        // Hibernation happens after the subsequent status update finishes
+        needsFullClearBeforeNextStatus = true; // Set flag: next status needs full clear
+        display.hibernate();           // Hibernate after FULL update
     }
     else if (newQrDataReceived) {
-        newQrDataReceived = false;    // Reset flag
+        newQrDataReceived = false;    // Reset flag *before* action
         Serial.println("Processing new QR data...");
-        // Optionally show "Generating..." status first (partial)
-        // statusMessageToShow = "Generating QR...";
-        // showStatusMessage(statusMessageToShow.c_str()); // Draw status immediately
-        updateQrDisplay(currentDataString.c_str()); // FULL update (draws QR or error text)
+        updateQrDisplay(currentDataString.c_str()); // FULL update (draws QR or error)
         Serial.println("QR display update attempt complete.");
+        needsFullClearBeforeNextStatus = true; // Set flag: next status needs full clear
         display.hibernate();          // Hibernate after FULL update
     }
     else if (statusUpdateRequested) {
-        statusUpdateRequested = false; // Reset flag
+        statusUpdateRequested = false; // Reset flag *before* action
+        Serial.println("Processing status message update...");
+
+        // *** CHECK if full clear is needed before this partial update ***
+        if (needsFullClearBeforeNextStatus) {
+            Serial.println("...Performing full screen clear before status update (previous update was full).");
+            performQuickFullClear(); // Clear the whole screen
+            needsFullClearBeforeNextStatus = false; // Reset the flag
+        }
+
+        // Now proceed with the partial update for the status message
         showStatusMessage(statusMessageToShow.c_str()); // PARTIAL update
         Serial.println("Status message updated.");
+        // Note: needsFullClearBeforeNextStatus remains false after a partial update
         display.hibernate();           // Hibernate after PARTIAL update
     }
 
-    // Allow BLE stack processing
+    // --- Allow BLE stack time to process ---
     delay(100);
 }
 
@@ -238,104 +248,117 @@ void setupBLE() {
 
     BLEService *pService = pServer->createService(SERVICE_UUID);
 
-    // --- Create the Single Data Characteristic ---
     pDataCharacteristic = pService->createCharacteristic(
                              DATA_CHARACTERISTIC_UUID,
-                             BLECharacteristic::PROPERTY_WRITE // Only needs write
+                             BLECharacteristic::PROPERTY_WRITE
                          );
-    pDataCharacteristic->setCallbacks(new DataCharacteristicCallbacks()); // Assign the callback
+    pDataCharacteristic->setCallbacks(new DataCharacteristicCallbacks());
 
-    // Add a User Description Descriptor (helps identify in some apps)
+    // Add a User Description Descriptor (UUID 0x2901)
+    // This is **highly recommended** for debugging with generic BLE tools (e.g., nRF Connect)
+    // It allows tools to show a human-readable name for the characteristic.
+    // While not strictly essential for function if using a dedicated app, it aids development greatly.
     BLEDescriptor* pDataDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
-    pDataDesc->setValue("URL or 'clear' command");
+    pDataDesc->setValue("URL data or 'clear' command");
     pDataCharacteristic->addDescriptor(pDataDesc);
 
-    // --- Start Service & Advertising ---
     pService->start();
+
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMinPreferred(0x12);
     BLEDevice::startAdvertising();
 
     Serial.println("BLE Service Started, Advertising.");
     Serial.printf("Device Name: %s\n", bleDeviceName);
     Serial.printf("Service UUID: %s\n", SERVICE_UUID);
-    Serial.printf("  Data Characteristic: %s (URL or 'clear')\n", DATA_CHARACTERISTIC_UUID);
+    Serial.printf("  Data Characteristic: %s (Write URL or 'clear')\n", DATA_CHARACTERISTIC_UUID);
 }
 
 // ===================================================================================
 // Show Status Message Function (PARTIAL UPDATE)
 // ===================================================================================
 void showStatusMessage(const char* message) {
-    if (!message || message[0] == '\0') return; // Skip empty messages
+    // (Function remains the same as previous version)
+    if (!message || message[0] == '\0') {
+        Serial.println("showStatusMessage: Skipping empty message.");
+        return;
+    }
+    Serial.printf("Display Status (Partial Update in area %d,%d %dx%d): %s\n",
+                  STATUS_AREA_X, STATUS_AREA_Y, STATUS_AREA_WIDTH, STATUS_AREA_HEIGHT, message);
 
-    Serial.printf("Display Status (Partial Update): %s\n", message);
-
-    // Set the partial window for the status message area
     display.setPartialWindow(STATUS_AREA_X, STATUS_AREA_Y, STATUS_AREA_WIDTH, STATUS_AREA_HEIGHT);
-
     display.firstPage();
     do {
-        // IMPORTANT for partial update: Fill the partial window area first to clear previous content
-        display.fillScreen(GxEPD_WHITE); // This fills only the partial window
+        display.fillScreen(GxEPD_WHITE); // Clear only the partial window
 
-        // Use the existing centered text function, but ensure it draws within the partial window bounds
-        // Calculate Y position relative to the *display* top, even though drawing happens in partial window
+        display.setFont(&FreeSans9pt7b);
         int16_t x1, y1; uint16_t w, h;
-        display.setFont(&FreeSans9pt7b); // Set font *before* getTextBounds
-        display.getTextBounds(message, 0, 0, &x1, &y1, &w, &h);
-
-        // Calculate baseline Y pos to roughly center vertically within the status area height
-        int baselineY = STATUS_AREA_Y + (STATUS_AREA_HEIGHT / 2) + (h / 2) - 4; // Adjust baseline offset slightly if needed
-
-        // Handle multi-line crude centering if newline exists
         const char* newline = strchr(message, '\n');
-         if (newline != NULL) {
-             int len = newline - message;
-             char line1[len + 1];
-             strncpy(line1, message, len);
-             line1[len] = '\0';
-             const char* line2 = newline + 1;
-             // Draw lines relative to the calculated baseline, centered horizontally within the status area
-             drawCenteredText(line1, baselineY - h, &FreeSans9pt7b, STATUS_AREA_WIDTH, STATUS_AREA_X);
-             drawCenteredText(line2, baselineY + 5, &FreeSans9pt7b, STATUS_AREA_WIDTH, STATUS_AREA_X);
-         } else {
-            // Single line message, centered horizontally within the status area
+
+        if (newline != NULL) {
+            // Two Line Message Centering
+            int lenLine1 = newline - message;
+            char line1[lenLine1 + 1];
+            strncpy(line1, message, lenLine1);
+            line1[lenLine1] = '\0';
+            const char* line2 = newline + 1;
+
+            display.getTextBounds(line1, 0, 0, &x1, &y1, &w, &h); // Use height of one line
+            int totalTextHeight = h * 2 + 5;
+            int baselineY1 = STATUS_AREA_Y + (STATUS_AREA_HEIGHT - totalTextHeight) / 2 + h;
+            if (baselineY1 < STATUS_AREA_Y + h) baselineY1 = STATUS_AREA_Y + h;
+
+            drawCenteredText(line1, baselineY1, &FreeSans9pt7b, STATUS_AREA_WIDTH, STATUS_AREA_X);
+            drawCenteredText(line2, baselineY1 + h + 5, &FreeSans9pt7b, STATUS_AREA_WIDTH, STATUS_AREA_X);
+        } else {
+            // Single Line Message Centering
+            display.getTextBounds(message, 0, 0, &x1, &y1, &w, &h);
+            int topY = STATUS_AREA_Y + (STATUS_AREA_HEIGHT - h) / 2;
+            int baselineY = topY - y1;
+             if (baselineY < STATUS_AREA_Y - y1) baselineY = STATUS_AREA_Y - y1;
+             if (baselineY > STATUS_AREA_Y + STATUS_AREA_HEIGHT ) baselineY = STATUS_AREA_Y + STATUS_AREA_HEIGHT;
             drawCenteredText(message, baselineY, &FreeSans9pt7b, STATUS_AREA_WIDTH, STATUS_AREA_X);
-         }
-
+        }
     } while (display.nextPage());
-
-    // IMPORTANT: Hibernation is handled by the main loop after this function returns
 }
-
 
 // ===================================================================================
 // Clear Display Function (FULL UPDATE)
 // ===================================================================================
 void clearDisplay() {
     Serial.println("Executing clearDisplay() (Full Update)...");
-    display.setFullWindow(); // Ensure full window context
+    performQuickFullClear(); // Use the helper function
+    Serial.println("Display cleared (Full Update finished). Screen is blank.");
+    // Hibernation handled by the loop
+}
+
+// ===================================================================================
+// Helper Function: Perform Quick Full Clear (No Hibernate)
+// ===================================================================================
+/**
+ * @brief Clears the entire display using a full update but DOES NOT hibernate.
+ *        Used internally before showing a partial update after a full update.
+ */
+void performQuickFullClear() {
+    display.setFullWindow();
     display.firstPage();
     do {
-        display.fillScreen(GxEPD_WHITE); // Fill entire screen
+        display.fillScreen(GxEPD_WHITE);
     } while (display.nextPage());
-    Serial.println("Display cleared.");
-    // Confirmation message and hibernation handled by the loop
 }
+
 
 // ===================================================================================
 // Update QR Display Function (FULL UPDATE)
 // ===================================================================================
 void updateQrDisplay(const char* textToEncode) {
     Serial.printf("Updating QR display (Full Update) for: '%s'\n", textToEncode);
-    display.setFullWindow(); // Ensure full window context
+    display.setFullWindow();
     display.firstPage();
     do {
-        display.fillScreen(GxEPD_WHITE); // Clear background fully
-        drawQrScreen(textToEncode);      // Draw QR or error message
+        display.fillScreen(GxEPD_WHITE);
+        drawQrScreen(textToEncode);
     } while (display.nextPage());
     // Hibernation handled by the loop
 }
@@ -344,83 +367,73 @@ void updateQrDisplay(const char* textToEncode) {
 // Draw QR Screen Function (Called during FULL UPDATE)
 // ===================================================================================
 void drawQrScreen(const char* textToEncode) {
-    // Attempt QR code generation and drawing (centered on full display)
+    // (Function remains the same as previous version)
     bool qrSuccess = drawQrCode(0, 0, display.width(), display.height(), textToEncode);
-
     if (!qrSuccess) {
         Serial.println("QR Code drawing failed. Displaying error message (Full Update).");
-        // Show a generic failure message centered on the full display
-        int yPos = display.height() / 2 + 5; // Approx center Y
-        drawCenteredText("QR Generation Failed", yPos, &FreeSans9pt7b); // Use full display width for centering
+        display.setFont(&FreeSans9pt7b);
+        int16_t x1, y1; uint16_t w, h;
+        const char* errMsg = "QR Generation Failed";
+        display.getTextBounds(errMsg, 0, 0, &x1, &y1, &w, &h);
+        int baselineY = (display.height() - h) / 2 - y1;
+        drawCenteredText(errMsg, baselineY, &FreeSans9pt7b);
     } else {
        Serial.println("QR Code drawn successfully (Full Update).");
     }
 }
 
 // ===================================================================================
-// Helper Function: Draw Centered Text (Used by both partial and full updates)
-// Target W/X parameters allow specifying the area to center within.
+// Helper Function: Draw Centered Text
 // ===================================================================================
 void drawCenteredText(const char *text, int baselineY, const GFXfont *font, int targetW /* = -1 */, int targetX /* = 0 */) {
+    // (Function remains the same as previous version)
     if (!font || !text || text[0] == '\0') return;
-
     int16_t x1, y1; uint16_t w, h;
     display.setFont(font);
     display.setTextColor(GxEPD_BLACK);
     display.setTextSize(1);
-
-    // Get text bounds to calculate width and handle baseline offset (y1)
     display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
-
-    // Determine the centering area
-    int areaWidth = (targetW == -1) ? display.width() : targetW;
-    int areaOriginX = (targetW == -1) ? 0 : targetX;
-
-    // Calculate cursor X position for horizontal centering within the target area
-    int cursorX = areaOriginX + ((areaWidth - w) / 2) - x1;
-
-    // Set cursor and print. baselineY is the desired vertical position for the text baseline.
+    int areaWidth = (targetW <= 0) ? display.width() : targetW;
+    int areaOriginX = (targetW <= 0) ? 0 : targetX;
+    int cursorX = areaOriginX + (areaWidth - w) / 2 - x1;
     display.setCursor(cursorX, baselineY);
     display.print(text);
 }
 
-
 // ===================================================================================
-// Draw QR Code Function (Used by FULL UPDATE)
+// Draw QR Code Function (Used by FULL UPDATE's drawQrScreen)
 // ===================================================================================
 bool drawQrCode(int x_target_area, int y_target_area, int w_target_area, int h_target_area, const char *text) {
-    // (Keep this function exactly as it was in the previous version)
-    // ... (validation, buffer allocation, generation, scaling, drawing) ...
-    // 1. Basic Validation
+    // (Function remains the same as previous version)
     if (text == NULL || text[0] == '\0') { Serial.println("QR Error: No text provided."); return false; }
     int inputLength = strlen(text);
     if (inputLength > MAX_INPUT_STRING_LENGTH) { Serial.printf("QR Error: Input text too long (%d > %d).\n", inputLength, MAX_INPUT_STRING_LENGTH); return false; }
     Serial.printf("Generating QR Code for: '%s' (Length: %d)\n", text, inputLength);
 
-    // 2. QR Code Buffer (Stack Allocation)
     uint32_t bufferSize = qrcode_getBufferSize(FIXED_QR_VERSION);
     if (bufferSize == 0) { Serial.printf("QR Error: Could not get buffer size for version %d.\n", FIXED_QR_VERSION); return false; }
-    uint8_t qrcodeData[bufferSize]; // Ensure stack space!
+    const int MAX_STACK_QR_BUFFER = 4096;
+    if (bufferSize > MAX_STACK_QR_BUFFER) { Serial.printf("QR Error: Calculated buffer size (%d) may be too large for stack.\n", bufferSize); return false; }
+    uint8_t qrcodeData[bufferSize];
 
-    // 3. Generate QR Code Data
     QRCode qrcode;
     esp_err_t err = qrcode_initText(&qrcode, qrcodeData, FIXED_QR_VERSION, ECC_LOW, text);
-    if (err != ESP_OK) { Serial.printf("QR Error: qrcode_initText failed with error code %d.\n", err); return false; }
-    Serial.printf("QR generated successfully: Version=%d, Size=%dx%d modules\n", FIXED_QR_VERSION, qrcode.size, qrcode.size);
+    if (err != ESP_OK) { Serial.printf("QR Error: qrcode_initText failed. Error code: %d. Input may be too long for Version %d/ECC_LOW.\n", err, FIXED_QR_VERSION); return false; }
+    Serial.printf("QR generated successfully: Version=%d, Size=%dx%d modules\n", qrcode.version, qrcode.size, qrcode.size);
 
-    // 4. Calculate Scaling and Positioning
     int qr_modules_size = qrcode.size;
     int module_pixel_size = FIXED_QR_SCALE;
     int final_qr_pixel_size = qr_modules_size * module_pixel_size;
-    int total_modules_needed = qr_modules_size + (2 * QR_QUIET_ZONE_MODULES);
-    int total_pixel_size_needed = total_modules_needed * module_pixel_size;
-    if (total_pixel_size_needed > w_target_area || total_pixel_size_needed > h_target_area) { Serial.printf("QR Error: Scaled QR code (%dpx) too large for target area (%dx%d).\n", total_pixel_size_needed, w_target_area, h_target_area); return false; }
+
+    if (final_qr_pixel_size > w_target_area || final_qr_pixel_size > h_target_area) { Serial.printf("QR Warning: Scaled QR code data area (%dpx) might be larger than target area (%dx%d). Clipping might occur.\n", final_qr_pixel_size, w_target_area, h_target_area); }
+
     int x_offset = x_target_area + (w_target_area - final_qr_pixel_size) / 2;
     int y_offset = y_target_area + (h_target_area - final_qr_pixel_size) / 2;
-    if (x_offset < 0) x_offset = 0; if (y_offset < 0) y_offset = 0;
-    Serial.printf("Drawing QR Code at display offset (%d, %d) with scale %d.\n", x_offset, y_offset, module_pixel_size);
+    if (x_offset < x_target_area) x_offset = x_target_area;
+    if (y_offset < y_target_area) y_offset = y_target_area;
+    Serial.printf("Drawing QR Code at display offset (%d, %d) with scale %d. Target area: (%d,%d %dx%d)\n", x_offset, y_offset, module_pixel_size, x_target_area, y_target_area, w_target_area, h_target_area);
 
-    // 5. Draw the QR Code Modules
+    display.startWrite();
     for (int y = 0; y < qr_modules_size; y++) {
         for (int x = 0; x < qr_modules_size; x++) {
             if (qrcode_getModule(&qrcode, x, y)) {
@@ -432,5 +445,6 @@ bool drawQrCode(int x_target_area, int y_target_area, int w_target_area, int h_t
             }
         }
     }
-    return true; // Success!
+    display.endWrite();
+    return true;
 }
