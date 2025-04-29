@@ -56,6 +56,11 @@ const char *NVS_KEY_MODE = "dispMode";
 #define QRURL_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26ad" // Example: +4
 // Note: Battery Service/Characteristic have standard UUIDs
 
+// Sleep Configuration
+#define uS_TO_S_FACTOR 1000000ULL // Conversion factor for micro seconds to seconds
+#define TIME_TO_SLEEP 30          // Sleep for 30 seconds (adjust as needed)
+#define ADVERTISE_DURATION 5000   // Advertise for 5 seconds after timer wake-up (milliseconds)
+
 // Battery Monitoring (Adjust pin if needed - common on LilyGo boards)
 #define BATT_ADC_PIN 35
 #define BATT_VOLTAGE_MAX 4.2
@@ -77,6 +82,7 @@ const unsigned long BATTERY_UPDATE_INTERVAL_MS = 15000; // Update every 15 secon
 
 // Wake Timer Control
 unsigned long wakeStartTime = 0;
+bool isTimerWake = false;
 
 // ===================================================================================
 // Configuration Constants
@@ -230,9 +236,13 @@ class MyServerCallbacks : public BLEServerCallbacks
     {
         deviceConnected = false;
         Serial.println("[DEBUG] === BLE Client Disconnected ===");
-        wakeStartTime = millis(); // <<< ADD THIS LINE to restart sleep timer
-        Serial.println("[DEBUG] onDisconnect: Sleep timeout timer restarted.");
-        // Advertising is stopped in the sleep logic before sleeping
+        // Restart advertising logic is now handled in setup() after wake or in loop() timeout
+        // Just log the event here. The main loop will handle going to sleep if needed.
+        // Remove the delay and startAdvertising from here.
+        // delay(500);
+        // BLEDevice::startAdvertising();
+        // Serial.println("Advertising restarted");
+        Serial.println("[DEBUG] onDisconnect: Device will advertise on next timer/button wake or eventually sleep.");
     }
 };
 
@@ -387,18 +397,29 @@ void setup()
         displayUpdateRequestNeeded = true; // Show current screen immediately
         BLEDevice::startAdvertising();     // Start advertising immediately
         Serial.println("[DEBUG] setup: Advertising started (Button Wake).");
-
+        isTimerWake = false;
         break;
-
+    case ESP_SLEEP_WAKEUP_TIMER:
+        Serial.println("[DEBUG] setup: Wakeup cause = Timer");
+        displayUpdateRequestNeeded = false; // Don't redraw screen on timer wake
+        BLEDevice::startAdvertising();      // Advertise for a short duration
+        Serial.printf("[DEBUG] setup: Advertising started (Timer Wake - %d ms duration).\n", ADVERTISE_DURATION);
+        isTimerWake = true;
+        break;
     default: // Includes power-on reset
         Serial.printf("[DEBUG] setup: Wakeup cause = Power On / Other (%d)\n", wakeup_reason);
         displayUpdateRequestNeeded = true; // Initial display update on power-on
         BLEDevice::startAdvertising();     // Start advertising on initial boot
         Serial.println("[DEBUG] setup: Advertising started (Power On).");
-
+        isTimerWake = false;
         break;
     }
 
+    // --- Configure Sleep ---
+    Serial.println("[DEBUG] setup: Configuring sleep sources...");
+    // Wake on Timer
+    esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
+    Serial.printf("[DEBUG] setup: Timer wakeup configured (%d sec).\n", TIME_TO_SLEEP);
     // Wake on Button Press (GPIO 39 = RTC GPIO 3)
     // Check ESP32 datasheet/pinout for RTC GPIO mapping if BUTTON_PIN changes
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0); // 0 = Wake on LOW level
@@ -431,6 +452,13 @@ void loop()
 
     if (deviceConnected)
     {
+        // --- DEVICE IS CONNECTED ---
+        if (isTimerWake)
+        {
+            isTimerWake = false;
+            wakeStartTime = millis();
+            Serial.println("[DEBUG] loop: CONNECTED during timer wake window. Staying awake.");
+        }
 
         sendBatteryNotification();
 
@@ -603,9 +631,22 @@ void loop()
         }
         // *** END ADDED/MODIFIED SECTION ***
 
+        // --- Sleep Logic ---
+        // Check Timer Wake Timeout
+        if (isTimerWake && (millis() - wakeStartTime >= ADVERTISE_DURATION))
+        {
+            Serial.printf("[DEBUG] loop(Disconnected): Timer wake timeout reached (%lu ms elapsed).\n", millis() - wakeStartTime);
+            Serial.println("[DEBUG] loop(Disconnected): Stopping advertising...");
+            BLEDevice::stopAdvertising();
+            Serial.println("[DEBUG] loop(Disconnected): Hibernating display...");
+            display.hibernate();
+            Serial.println("[DEBUG] loop(Disconnected): >>> ENTERING DEEP SLEEP (Timer) <<<");
+            Serial.flush();
+            esp_deep_sleep_start();
+        }
         // Check Button/Power-On Wake Timeout
-        if (millis() - wakeStartTime >= 60000) // Example: 60 second timeout
-        {                                      // Example: 60 second timeout
+        else if (!isTimerWake && (millis() - wakeStartTime >= 60000))
+        { // Example: 60 second timeout
             Serial.printf("[DEBUG] loop(Disconnected): Button/Power-on wake timeout reached (%lu ms elapsed).\n", millis() - wakeStartTime);
             Serial.println("[DEBUG] loop(Disconnected): Stopping advertising...");
             BLEDevice::stopAdvertising();

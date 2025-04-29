@@ -1,0 +1,699 @@
+/**
+ * @file BleQrBadge_MultiScreen_V1.ino
+ * @brief E-Paper badge: Displays Personal Info or QR Code screens.
+ *        Switches screens via BLE command or physical button.
+ *        Receives data for each screen type via a single BLE characteristic.
+ *        Uses Full updates for screen changes.
+ *        Landscape & Centered. Single Service/Characteristic.
+ * @author Amir Akrami (modified based on user request)
+ */
+
+// Core GxEPD2 library
+#include <GxEPD2_BW.h>
+
+// Font library for messages
+#include <Fonts/FreeSans9pt7b.h>  // Using 9pt font for info/status
+#include <Fonts/FreeSans12pt7b.h> // Larger font for info screen maybe?
+
+// QR Code Generation Library
+#include <qrcode.h>
+
+// Include Arduino core
+#include <Arduino.h>
+
+// === IMPORTANT: Display Configuration Header ===
+// Selected display type is in this file
+#include "GxEPD2_display_selection_new_style.h"
+// === IMPORTANT ===
+
+// --- BLE Includes ---
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLECharacteristic.h>
+#include <BLEAdvertising.h>
+
+// *** ADD BLE SECURITY INCLUDE ***
+#include <BLESecurity.h>
+
+// *** INCLUDE OneButton LIBRARY ***
+#include <OneButton.h>
+
+// ===================================================================================
+// Configuration Constants
+// ===================================================================================
+
+// --- Display Modes ---
+enum DisplayMode
+{
+    INFO,
+    QR_CODE,
+    BLANK // Represents a cleared state
+};
+
+// --- QR Code Configuration ---
+const int FIXED_QR_VERSION = 7;
+const int FIXED_QR_SCALE = 2;                 // Adjust scale based on your display size and desired QR size
+const int MAX_QR_INPUT_STRING_LENGTH = 90;    // Max length for QR data
+const int MAX_INFO_INPUT_STRING_LENGTH = 150; // Max length for personal info data
+const int QR_QUIET_ZONE_MODULES = 4;          // Standard quiet zone
+
+// --- BLE Configuration ---
+// TODO: Generate my own unique UUIDs for production!
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914c"             // Changed last char for distinction
+#define DATA_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a9" // Changed last char
+
+const char *bleDeviceName = "PixelTag";
+
+// --- Button Configuration ---
+#define BUTTON_PIN 39                    // GPIO0 is often the 'BOOT' button on ESP32 dev boards. Change if needed.
+const unsigned long DEBOUNCE_DELAY = 50; // milliseconds
+
+// ===================================================================================
+// Global Variables
+// ===================================================================================
+// --- Display ---
+// 'display' object created in GxEPD2_display_selection_new_style.h
+
+// --- State & Data Handling ---
+DisplayMode currentMode = INFO;   // Start by showing info screen
+DisplayMode requestedMode = INFO; // Mode requested by BLE or button
+String personalInfo = "No Info Received Yet.\nUse BLE to send data.";
+String qrCodeData = "";                 // Start with no QR data
+bool displayUpdateRequestNeeded = true; // Trigger initial display update
+bool clearDisplayRequested = false;     // Flag for clear command
+
+// --- Data Received Flags (set by BLE callback) ---
+bool newInfoDataReceived = false;
+bool newQrDataReceived = false;
+
+// --- Button State ---
+int lastButtonState = HIGH; // Assuming INPUT_PULLUP
+unsigned long lastDebounceTime = 0;
+unsigned long lastButtonActionTime = 0;        // <<< ADD THIS LINE (Timestamp of last action)
+const unsigned long BUTTON_COOLDOWN_MS = 5000; // <<< ADD THIS LINE (5 seco
+// --- BLE ---
+BLEServer *pServer = NULL;
+BLECharacteristic *pDataCharacteristic = NULL;
+bool deviceConnected = false;
+
+// *** CREATE OneButton INSTANCE ***
+// Param 1: Pin, Param 2: active LOW (true for INPUT_PULLUP), Param 3: enable internal pull-up (true)
+OneButton button(BUTTON_PIN, true, true);
+
+// ===================================================================================
+// Function Prototypes
+// ===================================================================================
+void setupBLE();
+void updateDisplay();    // Main function to refresh screen based on currentMode (FULL UPDATE)
+void drawInfoScreen();   // Draws the personal info content
+void drawQrScreen();     // Draws the QR code content or error message
+void performFullClear(); // Clears screen fully (FULL UPDATE)
+void drawCenteredText(const char *text, int baselineY, const GFXfont *font, uint16_t color = GxEPD_BLACK, int targetW = -1, int targetX = 0);
+bool drawQrCode(int x_target_area, int y_target_area, int w_target_area, int h_target_area, const char *text);
+
+// *** ADD NEW CALLBACK PROTOTYPE ***
+void handleButtonClick(); // Callback function for OneButton
+// ===================================================================================
+// BLE Callback Classes
+// ===================================================================================
+
+// --- Server Connection Callbacks ---
+class MyServerCallbacks : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *pServerInstance)
+    { // Renamed parameter to avoid shadowing global
+        deviceConnected = true;
+        pServer = pServerInstance; // Store the server instance if needed elsewhere
+        Serial.println("BLE Client Connected");
+        // Optional: Could show a temporary "Connected" message, but might interfere
+        // with current screen. Let's just log it for now.
+        // If you *want* a temporary status, you'd need a more complex display state machine.
+    }
+
+    void onDisconnect(BLEServer *pServerInstance)
+    {
+        deviceConnected = false;
+        Serial.println("BLE Client Disconnected");
+        // Don't automatically change the screen content on disconnect.
+        // Just restart advertising.
+        delay(500); // Give stacks time to settle
+        BLEDevice::startAdvertising();
+        Serial.println("Advertising restarted");
+    }
+};
+
+// --- Data Characteristic Write Callback ---
+class DataCharacteristicCallbacks : public BLECharacteristicCallbacks
+{
+    void onWrite(BLECharacteristic *pCharacteristic)
+    {
+        std::string value = pCharacteristic->getValue();
+        String valueStr = String(value.c_str());
+        valueStr.trim();
+
+        Serial.print("Received BLE Value: '");
+        Serial.print(valueStr);
+        Serial.println("'");
+
+        if (valueStr.equalsIgnoreCase("command:clear"))
+        {
+            Serial.println("Clear command received.");
+            clearDisplayRequested = true;
+            newInfoDataReceived = false;
+            newQrDataReceived = false;
+            // Optional: maybe set requestedMode to BLANK here too?
+            // requestedMode = BLANK;
+        }
+        else if (valueStr.equalsIgnoreCase("display:info"))
+        {
+            Serial.println("Display Info command received.");
+            requestedMode = INFO;
+        }
+        else if (valueStr.equalsIgnoreCase("display:qr"))
+        {
+            Serial.println("Display QR command received.");
+            requestedMode = QR_CODE;
+        }
+        else if (valueStr.startsWith("data:personal:"))
+        {
+            String infoPayload = valueStr.substring(strlen("data:personal:"));
+            if (infoPayload.length() > MAX_INFO_INPUT_STRING_LENGTH)
+            {
+                Serial.printf("Error: Personal info too long (%d > %d)\n", infoPayload.length(), MAX_INFO_INPUT_STRING_LENGTH);
+            }
+            else
+            {
+                Serial.println("New personal info data received.");
+                personalInfo = infoPayload;
+                personalInfo.replace("\\n", "\n");
+                newInfoDataReceived = true;
+                clearDisplayRequested = false;
+                // *** ADD THIS LINE: Request info mode when info data arrives ***
+                requestedMode = INFO;
+                Serial.println("Automatically requesting INFO mode.");
+            }
+        }
+        else if (valueStr.startsWith("data:qr:"))
+        {
+            String qrPayload = valueStr.substring(strlen("data:qr:"));
+            if (qrPayload.length() > MAX_QR_INPUT_STRING_LENGTH)
+            {
+                Serial.printf("Error: QR data too long (%d > %d)\n", qrPayload.length(), MAX_QR_INPUT_STRING_LENGTH);
+            }
+            else
+            {
+                Serial.println("New QR code data received.");
+                qrCodeData = qrPayload;
+                newQrDataReceived = true;
+                clearDisplayRequested = false;
+                // *** ADD THIS LINE: Request QR mode when QR data arrives ***
+                requestedMode = QR_CODE;
+                Serial.println("Automatically requesting QR_CODE mode.");
+            }
+        }
+        else
+        {
+            Serial.println("Received unrecognized command/data format. Ignoring.");
+        }
+    }
+};
+
+// ===================================================================================
+// Setup Function
+// ===================================================================================
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial && millis() < 2000)
+        ; // Wait for serial, max 2s
+    Serial.println("\nStarting BLE Multi-Screen Badge");
+
+    // --- Initialize Display ---
+    display.init(115200);
+    Serial.println("Display initialized");
+    display.setRotation(1); // Landscape mode (adjust if your display is different)
+    Serial.printf("Display dimensions: %d x %d\n", display.width(), display.height());
+
+    // Attach the callback function to the click event
+    button.attachClick(handleButtonClick);
+
+    // --- Initial Screen State ---
+    currentMode = INFO; // Default to info screen first
+    requestedMode = currentMode;
+    displayUpdateRequestNeeded = true; // Ensure the initial screen is drawn
+
+    // --- Initialize BLE ---
+    setupBLE();
+
+    Serial.println("Setup complete. Initial display update pending...");
+}
+
+// ===================================================================================
+// Loop Function
+// ===================================================================================
+void loop()
+{
+    button.tick(); // Let the library process button state and call callbacks
+
+    // --- 2. Process Flags and Requested State Changes ---
+    bool needsRedraw = false;
+
+    // Priority 1: Clear Command
+    if (clearDisplayRequested)
+    {
+        clearDisplayRequested = false; // Consume flag
+        Serial.println("Processing Clear Request...");
+        if (currentMode != BLANK)
+        { // Only redraw if not already blank
+            currentMode = BLANK;
+            performFullClear();  // Perform the clear (full update)
+            needsRedraw = false; // The clear action *is* the redraw
+            display.hibernate(); // Hibernate after update
+        }
+        else
+        {
+            Serial.println("...already blank, skipping redraw.");
+        }
+        // Reset data received flags, as the clear overrides showing new data immediately
+        newInfoDataReceived = false;
+        newQrDataReceived = false;
+    }
+    // Priority 2: Mode Change Request (from Button or BLE)
+    else if (requestedMode != currentMode)
+    {
+        Serial.printf("Processing Mode Change Request: %d -> %d\n", currentMode, requestedMode);
+        // Check if data exists for the requested mode before switching
+        if (requestedMode == QR_CODE && qrCodeData.length() == 0)
+        {
+            Serial.println("...QR mode requested, but no QR data available. Staying in current mode.");
+            requestedMode = currentMode; // Revert request
+        }
+        else if (requestedMode == INFO && personalInfo.length() == 0)
+        {
+            Serial.println("...Info mode requested, but no Info data available. Staying in current mode.");
+            // Allow showing default "No Info" message, so don't revert here
+            currentMode = requestedMode; // Accept the switch
+            needsRedraw = true;
+        }
+        else
+        {
+            currentMode = requestedMode; // Accept the switch
+            needsRedraw = true;
+        }
+    }
+    // Priority 3: New Data Received for the *Current* Mode
+    else if (newInfoDataReceived && currentMode == INFO)
+    {
+        Serial.println("Processing New Info Data for Current Screen...");
+        needsRedraw = true;
+    }
+    else if (newQrDataReceived && currentMode == QR_CODE)
+    {
+        Serial.println("Processing New QR Data for Current Screen...");
+        needsRedraw = true;
+    }
+
+    // --- Consume Data Received Flags ---
+    // Do this regardless of redraw, so we don't re-process old data later
+    newInfoDataReceived = false;
+    newQrDataReceived = false;
+
+    // --- Trigger Display Update If Needed ---
+    if (needsRedraw || displayUpdateRequestNeeded)
+    {
+        displayUpdateRequestNeeded = false; // Consume flag
+        Serial.println("Updating Display...");
+        updateDisplay(); // Perform full update for the current mode
+        Serial.println("Display Update Complete.");
+        display.hibernate(); // Hibernate after update
+    }
+
+    // --- Allow BLE stack time & prevent busy-waiting ---
+    delay(10); // Short delay for loop responsiveness
+}
+
+// ===================================================================================
+// BLE Setup Function (MODIFIED FOR SECURITY)
+// ===================================================================================
+void setupBLE()
+{
+    Serial.println("Initializing BLE...");
+    BLEDevice::init(bleDeviceName);
+
+    Serial.println("Setting up BLE Security...");
+
+    // *** USE STANDARD SECURE CONFIGURATION ***
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT); // Encryption required after bonding
+
+    BLESecurity *pSecurity = new BLESecurity();
+    pSecurity->setCapability(ESP_IO_CAP_NONE);                 // Badge cannot display/enter PIN
+    pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND); // Use Secure Connections & Require Bonding
+    // No need to explicitly set InitEncryptionKey or RespEncryptionKey unless solving a specific issue
+    // Let the stack use defaults based on AuthenticationMode and Capability.
+
+    Serial.println("BLE Security configured (Standard: Encrypt, SC+Bond, NoInputNoOutput).");
+    // *** END SECURITY CONFIGURATION ***
+
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+
+    pDataCharacteristic = pService->createCharacteristic(
+        DATA_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE // Standard Write property
+    );
+
+    pDataCharacteristic->setCallbacks(new DataCharacteristicCallbacks());
+
+    BLEDescriptor *pDataDesc = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+    pDataDesc->setValue("Badge Data/Commands (Encrypted Write)");
+    pDataCharacteristic->addDescriptor(pDataDesc);
+
+    pService->start();
+
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    // Advertising flags might be needed to signal security capabilities, often handled automatically
+    // pAdvertising->setMinPreferred(0x06);
+    // pAdvertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+
+    Serial.println("BLE Service Started, Advertising.");
+    Serial.printf("Device Name: %s\n", bleDeviceName);
+    Serial.printf("Service UUID: %s\n", SERVICE_UUID);
+    Serial.printf("  Data/Cmd Characteristic: %s (Encrypted Write)\n", DATA_CHARACTERISTIC_UUID); // Note change
+}
+
+// ===================================================================================
+// Handle Button Press Function
+// ===================================================================================
+void handleButtonClick()
+{
+    // Cooldown Check
+    if (millis() - lastButtonActionTime < BUTTON_COOLDOWN_MS)
+    {
+        Serial.println("Button Click Ignored (Cooldown Active)");
+        return; // Exit if within cooldown period
+    }
+
+    // If cooldown passed, proceed:
+    Serial.println("Button Click Detected (OneButton)"); // Log confirms callback triggered
+
+    DisplayMode modeBeforeRequest = requestedMode; // Store original request state
+
+    // --- Mode Switching Logic (INFO -> QR -> BLANK -> INFO) ---
+    Serial.printf("Button Check: currentMode=%d, qrCodeData.length()=%d\n", currentMode, qrCodeData.length());
+
+    switch (currentMode)
+    {
+    case INFO:
+        if (qrCodeData.length() > 0)
+        {
+            requestedMode = QR_CODE;
+            Serial.println("Button: Requesting QR_CODE mode.");
+        }
+        else
+        {
+            requestedMode = BLANK; // Go to blank if no QR data
+            Serial.println("Button: Requesting BLANK mode (QR data missing).");
+        }
+        break;
+    case QR_CODE:
+        requestedMode = BLANK; // Next state is BLANK
+        Serial.println("Button: Requesting BLANK mode (Clear).");
+        break;
+    case BLANK:
+        requestedMode = INFO; // Next state is INFO
+        Serial.println("Button: Requesting INFO mode (from BLANK).");
+        break;
+    default:
+        requestedMode = INFO; // Fallback
+        break;
+    }
+
+    // --- UPDATE ACTION TIMESTAMP ---
+    // Update only if a mode change was successfully requested and will be processed
+    if (requestedMode != modeBeforeRequest || requestedMode != currentMode)
+    {
+        lastButtonActionTime = millis(); // Start cooldown timer
+        Serial.println("Cooldown timer started.");
+    }
+}
+
+// ===================================================================================
+// Update Display Function (FULL UPDATE)
+// ===================================================================================
+void updateDisplay()
+{
+    display.setFullWindow();
+    display.firstPage();
+    do
+    {
+        display.fillScreen(GxEPD_WHITE); // Clear buffer for this page
+        switch (currentMode)
+        {
+        case INFO:
+            drawInfoScreen();
+            break;
+        case QR_CODE:
+            // Only attempt to draw QR if data actually exists
+            if (qrCodeData.length() > 0)
+            {
+                drawQrScreen();
+            }
+            else
+            {
+                // This case should ideally be prevented by the logic in loop()
+                // but as a fallback, show an error message.
+                Serial.println("Error: Tried to draw QR screen with no data!");
+                drawCenteredText("No QR Data Available", display.height() / 2, &FreeSans9pt7b, GxEPD_BLACK);
+            }
+            break;
+        case BLANK:
+            // Already cleared by fillScreen, do nothing else
+            break;
+        }
+    } while (display.nextPage());
+    Serial.printf("Full display update performed for mode: %d\n", currentMode);
+}
+
+// ===================================================================================
+// Perform Full Clear Function (FULL UPDATE)
+// ===================================================================================
+void performFullClear()
+{
+    Serial.println("Performing full screen clear...");
+    display.setFullWindow();
+    display.firstPage();
+    do
+    {
+        display.fillScreen(GxEPD_WHITE);
+    } while (display.nextPage());
+    Serial.println("Screen cleared.");
+    currentMode = BLANK;   // Ensure state reflects the cleared screen
+    requestedMode = BLANK; // Sync requested mode too
+}
+
+// ===================================================================================
+// Draw Info Screen Function (Called during FULL UPDATE)
+// ===================================================================================
+void drawInfoScreen()
+{
+    Serial.printf("Drawing Info Screen with data: '%s'\n", personalInfo.c_str());
+    const GFXfont *infoFont = &FreeSans12pt7b; // Use a slightly larger font
+    display.setFont(infoFont);
+    display.setTextColor(GxEPD_BLACK);
+
+    // Basic multi-line handling (split by '\n')
+    int16_t x1, y1;
+    uint16_t w, h;
+    char textBuf[MAX_INFO_INPUT_STRING_LENGTH + 1]; // Buffer for manipulation
+    strncpy(textBuf, personalInfo.c_str(), MAX_INFO_INPUT_STRING_LENGTH);
+    textBuf[MAX_INFO_INPUT_STRING_LENGTH] = '\0'; // Ensure null termination
+
+    int lineCount = 0;
+    char *lines[10]; // Max 10 lines, adjust if needed
+    char *ptr = strtok(textBuf, "\n");
+    while (ptr != NULL && lineCount < 10)
+    {
+        lines[lineCount++] = ptr;
+        ptr = strtok(NULL, "\n");
+    }
+
+    if (lineCount == 0)
+    { // Handle empty string case
+        drawCenteredText("No Info", display.height() / 2, infoFont, GxEPD_BLACK);
+        return;
+    }
+
+    // Calculate total height needed
+    display.getTextBounds("Aj", 0, 0, &x1, &y1, &w, &h); // Get height of a typical line
+    int lineHeight = h + 5;                              // Add some spacing between lines
+    int totalTextHeight = (lineCount * h) + ((lineCount - 1) * 5);
+
+    // Calculate starting Y position for vertical centering
+    int startY = (display.height() - totalTextHeight) / 2;
+    // Ensure it doesn't start above the top edge (adjust baseline relative to top)
+    int baselineY = startY - y1; // y1 is typically negative (offset from baseline up to top)
+    if (baselineY < -y1)
+        baselineY = -y1; // Prevent drawing off the top
+
+    // Draw each line centered horizontally
+    for (int i = 0; i < lineCount; i++)
+    {
+        drawCenteredText(lines[i], baselineY + (i * lineHeight), infoFont, GxEPD_BLACK);
+    }
+}
+
+// ===================================================================================
+// Draw QR Screen Function (Called during FULL UPDATE)
+// ===================================================================================
+void drawQrScreen()
+{
+    // Use the global qrCodeData
+    Serial.printf("Drawing QR Screen for: '%s'\n", qrCodeData.c_str());
+    bool qrSuccess = drawQrCode(0, 0, display.width(), display.height(), qrCodeData.c_str());
+
+    if (!qrSuccess)
+    {
+        Serial.println("QR Code drawing failed. Displaying error message.");
+        // Use a standard font for the error message
+        drawCenteredText("QR Generation Failed", display.height() / 2, &FreeSans9pt7b, GxEPD_BLACK);
+    }
+    else
+    {
+        Serial.println("QR Code drawn successfully.");
+    }
+}
+
+// ===================================================================================
+// Helper Function: Draw Centered Text
+// ===================================================================================
+void drawCenteredText(const char *text, int baselineY, const GFXfont *font, uint16_t color /* = GxEPD_BLACK */, int targetW /* = -1 */, int targetX /* = 0 */)
+{
+    // (Function remains largely the same, added color parameter)
+    if (!font || !text || text[0] == '\0')
+        return;
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.setFont(font);
+    display.setTextColor(color);
+    display.setTextSize(1);
+    display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h); // x1,y1 are offsets from cursor pos to top-left; w,h are bounds size
+
+    int areaWidth = (targetW <= 0) ? display.width() : targetW;
+    int areaOriginX = (targetW <= 0) ? 0 : targetX;
+
+    // Calculate cursor X to center the text's bounding box
+    // cursorX = areaOriginX + (areaWidth / 2) - (w / 2) - x1; // This centers the bounding box
+    // Simpler centering (often looks better for text):
+    int cursorX = areaOriginX + (areaWidth - w) / 2;
+
+    // Adjust Y baseline if needed (e.g., prevent drawing off screen)
+    if (baselineY < -y1)
+        baselineY = -y1; // Make sure top of text isn't above screen (y1 is negative)
+    if (baselineY > display.height() - (h + y1))
+        baselineY = display.height() - (h + y1); // Prevent bottom going off screen
+
+    display.setCursor(cursorX, baselineY);
+    display.print(text);
+}
+
+// ===================================================================================
+// Draw QR Code Function (Used by drawQrScreen)
+// ===================================================================================
+bool drawQrCode(int x_target_area, int y_target_area, int w_target_area, int h_target_area, const char *text)
+{
+    // (Function remains the same as previous version, just ensure logging is clear)
+    if (text == NULL || text[0] == '\0')
+    {
+        Serial.println("QR Error: No text provided.");
+        return false;
+    }
+    int inputLength = strlen(text);
+    if (inputLength > MAX_QR_INPUT_STRING_LENGTH)
+    {
+        Serial.printf("QR Error: Input text too long (%d > %d).\n", inputLength, MAX_QR_INPUT_STRING_LENGTH);
+        return false;
+    }
+    Serial.printf("Generating QR Code for: '%s' (Length: %d)\n", text, inputLength);
+
+    // --- QR Code Generation ---
+    // Ensure sufficient buffer. qrcode_getBufferSize is recommended.
+    uint32_t bufferSize = qrcode_getBufferSize(FIXED_QR_VERSION);
+    if (bufferSize == 0)
+    {
+        Serial.printf("QR Error: Could not get buffer size for version %d.\n", FIXED_QR_VERSION);
+        return false;
+    }
+    // Dynamically allocate if large, or use large static/stack buffer if feasible
+    const int MAX_STACK_QR_BUFFER = 4096; // Adjust based on ESP32 memory
+    if (bufferSize > MAX_STACK_QR_BUFFER)
+    {
+        Serial.printf("QR Error: Calculated buffer size (%d) too large for stack buffer (%d).\n", bufferSize, MAX_STACK_QR_BUFFER);
+        // Consider dynamic allocation here if needed: uint8_t* qrcodeData = new uint8_t[bufferSize];
+        // Remember to delete[] qrcodeData; later!
+        return false;
+    }
+    uint8_t qrcodeData[bufferSize]; // Use stack allocation if size is acceptable
+
+    QRCode qrcode;
+    // ECC_LOW allows more data, ECC_MEDIUM/ECC_QUARTILE/ECC_HIGH provide better error correction
+    esp_err_t err = qrcode_initText(&qrcode, qrcodeData, FIXED_QR_VERSION, ECC_LOW, text);
+    if (err != ESP_OK)
+    {
+        Serial.printf("QR Error: qrcode_initText failed. Error code: %d. Input may be too long for Version %d/ECC_LOW.\n", err, FIXED_QR_VERSION);
+        // If using dynamic allocation, delete[] qrcodeData here.
+        return false;
+    }
+    Serial.printf("QR generated: Version=%d, Size=%dx%d modules\n", qrcode.version, qrcode.size, qrcode.size);
+
+    // --- QR Code Drawing ---
+    int qr_modules_size = qrcode.size;
+    int module_pixel_size = FIXED_QR_SCALE; // Scale factor
+    int final_qr_pixel_size = qr_modules_size * module_pixel_size;
+
+    // Calculate centering offset within the target area
+    int x_offset = x_target_area + (w_target_area - final_qr_pixel_size) / 2;
+    int y_offset = y_target_area + (h_target_area - final_qr_pixel_size) / 2;
+
+    // Basic boundary checks (prevent drawing outside display buffer)
+    if (x_offset < 0)
+        x_offset = 0;
+    if (y_offset < 0)
+        y_offset = 0;
+    // Optional: Check if it *fits* at all
+    if (final_qr_pixel_size > w_target_area || final_qr_pixel_size > h_target_area)
+    {
+        Serial.printf("QR Warning: Scaled QR (%dpx) larger than target area (%dx%d). Will be clipped.\n", final_qr_pixel_size, w_target_area, h_target_area);
+    }
+
+    Serial.printf("Drawing QR at offset (%d, %d), scale %d. Target area: (%d,%d %dx%d)\n",
+                  x_offset, y_offset, module_pixel_size, x_target_area, y_target_area, w_target_area, h_target_area);
+
+    // Draw the QR code module by module
+    // display.startWrite(); // GxEPD2 manages this within firstPage/nextPage loop
+    for (int y = 0; y < qr_modules_size; y++)
+    {
+        for (int x = 0; x < qr_modules_size; x++)
+        {
+            if (qrcode_getModule(&qrcode, x, y))
+            { // Check if module is black
+                int moduleX = x_offset + x * module_pixel_size;
+                int moduleY = y_offset + y * module_pixel_size;
+                // Draw the scaled module (rectangle) - check bounds!
+                if (moduleX + module_pixel_size <= display.width() && moduleY + module_pixel_size <= display.height())
+                {
+                    display.fillRect(moduleX, moduleY, module_pixel_size, module_pixel_size, GxEPD_BLACK);
+                }
+            }
+        }
+    }
+    // display.endWrite(); // GxEPD2 manages this
+
+    // If using dynamic allocation: delete[] qrcodeData;
+    return true; // Success
+}
